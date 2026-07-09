@@ -340,13 +340,15 @@ fn read_exactly(mut reader: impl Read, buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Download (or read from cache), decompress, and parse one segment.
+/// Download (or read from cache), decompress, and parse one segment,
+/// ticking the band's progress bar when done.
 pub fn fetch_segment<B: AhiBand>(
     agent: &ureq::Agent,
     time: DateTime<Utc>,
     band: B,
     segment: u8,
     cache_dir: Option<&Path>,
+    progress: &indicatif::ProgressBar,
 ) -> Result<hsd::Segment> {
     let name = file_name(time, band, segment);
     let cache_path = cache_dir.map(|dir| dir.join(&name));
@@ -384,6 +386,6 @@ pub fn fetch_segment<B: AhiBand>(
             parsed.columns,
         );
     }
-    eprintln!("  {} segment {:02}/{} ready", band.code(), segment, SEGMENTS_PER_DISK);
+    progress.inc(1);
     Ok(parsed)
 }

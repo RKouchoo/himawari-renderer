@@ -366,19 +366,18 @@ pub fn combined(
         if bt.is_finite() {
             let height = ((PARALLAX_REF_TEMP - bt) / PARALLAX_LAPSE_K_PER_KM)
                 .clamp(0.0, PARALLAX_MAX_HEIGHT_KM);
-            if height > PARALLAX_MIN_HEIGHT_KM {
-                if let Some((app_col, app_line)) =
+            if height > PARALLAX_MIN_HEIGHT_KM
+                && let Some((app_col, app_line)) =
                     geometry.apparent_position(px.col, px.line, f64::from(height))
-                {
-                    let shifted = sample_bilinear(
-                        &bt_grid,
-                        ir_width,
-                        (app_col as f32 + 0.5) / ir_scale - 0.5,
-                        (app_line as f32 + 0.5) / ir_scale - 0.5,
-                    );
-                    if shifted.is_finite() {
-                        bt = shifted;
-                    }
+            {
+                let shifted = sample_bilinear(
+                    &bt_grid,
+                    ir_width,
+                    (app_col as f32 + 0.5) / ir_scale - 0.5,
+                    (app_line as f32 + 0.5) / ir_scale - 0.5,
+                );
+                if shifted.is_finite() {
+                    bt = shifted;
                 }
             }
         }

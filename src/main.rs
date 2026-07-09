@@ -14,16 +14,18 @@ mod hsd;
 mod tuning;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 use compose::{BandImage, FULL_DISK_SIZE};
@@ -114,6 +116,34 @@ struct Args {
     watch: bool,
 }
 
+/// Shared multi-bar registry so bars from concurrent jobs stack cleanly.
+fn progress() -> &'static MultiProgress {
+    static PROGRESS: OnceLock<MultiProgress> = OnceLock::new();
+    PROGRESS.get_or_init(MultiProgress::new)
+}
+
+/// One progress bar per fetch job: a band's 10 segments.
+fn band_bar(label: String) -> ProgressBar {
+    let bar = progress().add(ProgressBar::new(u64::from(SEGMENTS_PER_DISK)));
+    bar.set_style(
+        ProgressStyle::with_template("{prefix:>12} [{bar:24.cyan/blue}] {pos}/{len}")
+            .expect("valid progress template")
+            .progress_chars("=> "),
+    );
+    bar.set_prefix(label);
+    bar
+}
+
+/// A status line that renders above any active progress bars, degrading to
+/// plain stderr when the output is piped (so logs stay grep-able).
+fn status(message: String) {
+    if std::io::stderr().is_terminal() {
+        let _ = progress().println(&message);
+    } else {
+        eprintln!("{message}");
+    }
+}
+
 fn parse_ir_band(text: &str) -> Result<IrBand, String> {
     let digits = text.trim().trim_start_matches(['B', 'b']);
     let number: u8 = digits
@@ -134,10 +164,10 @@ fn parse_time(text: &str) -> Result<DateTime<Utc>> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if let Some(factor) = args.downsample {
-        if factor == 0 || !FULL_DISK_SIZE.is_multiple_of(factor) {
-            bail!("--downsample must divide {FULL_DISK_SIZE} (e.g. 1, 2, 4, 5, 8, 10)");
-        }
+    if let Some(factor) = args.downsample
+        && (factor == 0 || !FULL_DISK_SIZE.is_multiple_of(factor))
+    {
+        bail!("--downsample must divide {FULL_DISK_SIZE} (e.g. 1, 2, 4, 5, 8, 10)");
     }
     if let Some(threads) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -190,7 +220,7 @@ fn run_scene(
     time: DateTime<Utc>,
     downsample: usize,
 ) -> Result<()> {
-    eprintln!("Scene: {} UTC", time.format("%Y-%m-%d %H:%M"));
+    status(format!("Scene: {} UTC", time.format("%Y-%m-%d %H:%M")));
     let started = Instant::now();
 
     let b13 = IrBand::new(13).expect("13 is a valid IR band");
@@ -202,26 +232,40 @@ fn run_scene(
     let bands: Vec<BandImage> = Band::ALL
         .into_par_iter()
         .map(|band| -> Result<BandImage> {
+            let bar = band_bar(band.code().to_string());
             let segments = (1..=SEGMENTS_PER_DISK)
                 .into_par_iter()
                 .map(|segment| {
-                    fetch::fetch_segment(agent, time, band, segment, args.cache_dir.as_deref())
+                    fetch::fetch_segment(
+                        agent,
+                        time,
+                        band,
+                        segment,
+                        args.cache_dir.as_deref(),
+                        &bar,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
+            bar.finish_and_clear();
             compose::assemble_band(band, segments)
         })
         .collect::<Result<Vec<_>>>()?;
-    eprintln!("All bands assembled after {:.1}s", started.elapsed().as_secs_f32());
+    status(format!(
+        "All bands assembled after {:.1}s",
+        started.elapsed().as_secs_f32(),
+    ));
 
     // B13 is shared by --combined and a possible --clut-bands 13; fetch and
     // assemble it once.
     let fetch_ir = |band: IrBand| -> Result<(hsd::Calibration, hsd::Projection, Vec<u16>)> {
+        let bar = band_bar(band.to_string());
         let segments = (1..=SEGMENTS_PER_DISK)
             .into_par_iter()
             .map(|segment| {
-                fetch::fetch_segment(agent, time, band, segment, args.cache_dir.as_deref())
+                fetch::fetch_segment(agent, time, band, segment, args.cache_dir.as_deref(), &bar)
             })
             .collect::<Result<Vec<_>>>()?;
+        bar.finish_and_clear();
         compose::assemble_counts(IrBand::WIDTH, segments)
     };
     let b13_data = if need_b13 { Some(fetch_ir(b13)?) } else { None };
@@ -229,12 +273,21 @@ fn run_scene(
     // The 2 km B05 band for the natural-color product, upsampled onto the
     // 1 km grid during assembly.
     let b05_image = if args.natural {
+        let bar = band_bar(Band::B05.code().to_string());
         let segments = (1..=SEGMENTS_PER_DISK)
             .into_par_iter()
             .map(|segment| {
-                fetch::fetch_segment(agent, time, Band::B05, segment, args.cache_dir.as_deref())
+                fetch::fetch_segment(
+                    agent,
+                    time,
+                    Band::B05,
+                    segment,
+                    args.cache_dir.as_deref(),
+                    &bar,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
+        bar.finish_and_clear();
         Some(compose::assemble_band(Band::B05, segments)?)
     } else {
         None
@@ -306,7 +359,7 @@ fn run_scene(
             save_png(&ir_output_path(&args.out, ir_band), image)
         })?;
 
-    eprintln!("Done in {:.1}s total", started.elapsed().as_secs_f32());
+    status(format!("Done in {:.1}s total", started.elapsed().as_secs_f32()));
     Ok(())
 }
 
@@ -345,14 +398,14 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
     }
 
     let total_slots = ((end - start).num_minutes() / 10 + 1) as usize;
-    eprintln!(
+    status(format!(
         "Timelapse: {} slots from {} to {} UTC ({} frames/s, ~{} GB of downloads)",
         total_slots,
         start.format("%Y-%m-%d %H:%M"),
         end.format("%Y-%m-%d %H:%M"),
         args.fps,
         total_slots * 7 / 10,
-    );
+    ));
 
     let frames_dir = args.out.with_file_name(format!(
         "{}_frames",
@@ -371,6 +424,16 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
         .collect();
 
     let started = Instant::now();
+    let frames_bar = progress().add(ProgressBar::new(slots.len() as u64));
+    frames_bar.set_style(
+        ProgressStyle::with_template(
+            "{prefix:>12} [{bar:24.green/blue}] {pos}/{len} {msg} ({elapsed})",
+        )
+        .expect("valid progress template")
+        .progress_chars("=> "),
+    );
+    frames_bar.set_prefix("frames");
+
     // Pipeline: TIMELAPSE_PREFETCH producer threads download and assemble
     // scenes ahead of the consumer below, which renders frames in slot
     // order (a small reorder buffer absorbs producers finishing out of
@@ -412,31 +475,30 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
             match outcome {
                 Ok(()) => {
                     rendered += 1;
-                    eprintln!(
-                        "[{}/{}] {} UTC done ({:.0}s elapsed)",
-                        expected + 1,
-                        slots.len(),
-                        slots[expected].format("%H:%M"),
-                        started.elapsed().as_secs_f32(),
-                    );
+                    frames_bar.set_message(format!("{} UTC", slots[expected].format("%H:%M")));
                 }
-                Err(error) => eprintln!(
+                Err(error) => status(format!(
                     "[{}/{}] {} UTC skipped: {error:#}",
                     expected + 1,
                     slots.len(),
                     slots[expected].format("%H:%M"),
-                ),
+                )),
             }
+            frames_bar.inc(1);
         }
         Ok(rendered)
     })?;
+    frames_bar.finish_and_clear();
     if rendered == 0 {
         bail!("no scene in the range could be rendered");
     }
 
     let video = args.out.with_extension("mp4");
-    let status = Command::new("ffmpeg")
-        .args(["-y", "-framerate", &args.fps.to_string(), "-i"])
+    let spinner = progress().add(ProgressBar::new_spinner());
+    spinner.set_message("encoding video with ffmpeg…");
+    spinner.enable_steady_tick(StdDuration::from_millis(120));
+    let encode = Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-y", "-framerate", &args.fps.to_string(), "-i"])
         .arg(frames_dir.join("frame_%05d.png"))
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
         .args(["-crf", &tuning::VIDEO_CRF.to_string()])
@@ -444,7 +506,8 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
         .arg(&video)
         .status()
         .context("running ffmpeg")?;
-    if !status.success() {
+    spinner.finish_and_clear();
+    if !encode.success() {
         bail!(
             "ffmpeg failed; the frames are kept in {} for manual encoding",
             frames_dir.display(),
@@ -453,13 +516,13 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
     std::fs::remove_dir_all(&frames_dir)
         .with_context(|| format!("cleaning up {}", frames_dir.display()))?;
 
-    eprintln!(
+    status(format!(
         "Wrote {} ({} frames at {} fps) in {:.0}s total",
         video.display(),
         rendered,
         args.fps,
         started.elapsed().as_secs_f32(),
-    );
+    ));
     Ok(())
 }
 
@@ -467,10 +530,10 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
 /// overwriting the same output paths. Runs until interrupted.
 fn run_watch(agent: &ureq::Agent, args: &Args, downsample: usize) -> Result<()> {
     let (extra_bands, ir_needed) = required_bands(args);
-    eprintln!(
+    status(format!(
         "Watching for new scenes (polling every {}s, ctrl-c to stop)",
         tuning::WATCH_POLL_SECS,
-    );
+    ));
     let mut last_rendered: Option<DateTime<Utc>> = None;
     loop {
         match fetch::find_latest_scene(agent, &extra_bands, &ir_needed) {
@@ -483,12 +546,12 @@ fn run_watch(agent: &ureq::Agent, args: &Args, downsample: usize) -> Result<()> 
                         }
                     }
                     Err(error) => {
-                        eprintln!("scene {} failed: {error:#}", slot.format("%H:%M"));
+                        status(format!("scene {} failed: {error:#}", slot.format("%H:%M")));
                     }
                 }
             }
             Ok(_) => {} // still the scene we already rendered
-            Err(error) => eprintln!("scene probe failed: {error:#}"),
+            Err(error) => status(format!("scene probe failed: {error:#}")),
         }
         thread::sleep(StdDuration::from_secs(tuning::WATCH_POLL_SECS));
     }
@@ -511,26 +574,27 @@ fn fetch_scene(
     let bands: Vec<BandImage> = Band::ALL
         .into_par_iter()
         .map(|band| -> Result<BandImage> {
+            let bar = band_bar(format!("{} {}", time.format("%H:%M"), band.code()));
             let segments = (1..=SEGMENTS_PER_DISK)
                 .into_par_iter()
-                .map(|segment| fetch::fetch_segment(agent, time, band, segment, Some(cache_dir)))
+                .map(|segment| {
+                    fetch::fetch_segment(agent, time, band, segment, Some(cache_dir), &bar)
+                })
                 .collect::<Result<Vec<_>>>()?;
+            bar.finish_and_clear();
             compose::assemble_band(band, segments)
         })
         .collect::<Result<Vec<_>>>()?;
     let b13 = if with_b13 {
+        let b13 = IrBand::new(13).expect("13 is a valid IR band");
+        let bar = band_bar(format!("{} {}", time.format("%H:%M"), b13));
         let segments = (1..=SEGMENTS_PER_DISK)
             .into_par_iter()
             .map(|segment| {
-                fetch::fetch_segment(
-                    agent,
-                    time,
-                    IrBand::new(13).expect("13 is a valid IR band"),
-                    segment,
-                    Some(cache_dir),
-                )
+                fetch::fetch_segment(agent, time, b13, segment, Some(cache_dir), &bar)
             })
             .collect::<Result<Vec<_>>>()?;
+        bar.finish_and_clear();
         Some(compose::assemble_counts(IrBand::WIDTH, segments)?)
     } else {
         None
@@ -571,7 +635,8 @@ fn render_scene_frame(
             downsample,
         )?
     };
-    save_png(frame_path, image)
+    // The frames bar tracks progress; a status line per frame would be noise.
+    write_png(frame_path, image)
 }
 
 /// Delete every cached .DAT.bz2 belonging to one observation slot.
@@ -581,10 +646,11 @@ fn purge_scene_cache(cache_dir: &Path, time: DateTime<Utc>) {
         return;
     };
     for entry in entries.flatten() {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with("HS_H09") && name.contains(&stamp) {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && name.starts_with("HS_H09")
+            && name.contains(&stamp)
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -602,12 +668,16 @@ fn ir_output_path(out: &Path, band: IrBand) -> PathBuf {
     suffixed_output_path(out, &band.to_string())
 }
 
-fn save_png(path: &Path, image: compose::Rgb8Image) -> Result<()> {
-    let (width, height) = (image.width, image.height);
-    image::RgbImage::from_raw(width, height, image.data)
+fn write_png(path: &Path, image: compose::Rgb8Image) -> Result<()> {
+    image::RgbImage::from_raw(image.width, image.height, image.data)
         .context("assembling output image buffer")?
         .save(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    eprintln!("Wrote {} ({}x{})", path.display(), width, height);
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn save_png(path: &Path, image: compose::Rgb8Image) -> Result<()> {
+    let (width, height) = (image.width, image.height);
+    write_png(path, image)?;
+    status(format!("Wrote {} ({width}x{height})", path.display()));
     Ok(())
 }

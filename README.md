@@ -1,8 +1,8 @@
-# 🌏 himawari-earth
+# himawari-renderer
 
-**Render the Earth, as seen right now from geostationary orbit.**
+**Render the latest files from the Himawari 9 geostationary satellite**
 
-`himawari-earth` downloads raw Level-1b data from the [Himawari-9](https://registry.opendata.aws/noaa-himawari/)
+`himawari-renderer` downloads raw Level-1b data from the [Himawari-9](https://registry.opendata.aws/noaa-himawari/)
 weather satellite (free, no account needed) and renders it into full-disk
 imagery: true color, natural color, infrared enhancements, cloud-top
 height, a combined day/night product, timelapse video, and a live
@@ -12,24 +12,19 @@ self-updating mode.
   <img src="examples/previews/combined_convection.jpg" width="70%" alt="Combined day/night product: true-color Earth with colorized cold cloud tops">
 </p>
 
-Written in Rust — strongly typed end to end, fully parallel (every file
-download, decompression, and parse is a rayon task; compositing is
-parallelized per output row), and fast: a cached scene renders all products
-in seconds, and a cold run is limited only by your bandwidth.
-
 ## Features
 
-- 🛰️ **True color** at the sensor's full 11000×11000 (1 km/pixel) resolution
-- 🌗 **Combined day/night product** — true color by day, infrared clouds by
+- **True color** at the sensor's full 11000×11000 (1 km/pixel) resolution
+- **Combined day/night product** — true color by day, infrared clouds by
   night, cold convective tops colorized in both (with parallax correction)
-- 🌈 **IR enhancements** for any thermal band, in four palettes
-- ❄️ **Natural color** (1.6 µm) — separates ice cloud from water cloud
-- ⛰️ **Cloud-top height** rendered like a relief map
-- 🎞️ **Timelapse video** with pipelined downloads (~2.5× faster than serial)
-- 🔄 **Watch mode** — a live Earth view that re-renders every 10 minutes
-- 🔬 **Physically grounded**: per-pixel solar/view geometry, sun-angle
+- **IR enhancements** for any thermal band, in four palettes
+- **Natural color** (1.6 µm) — separates ice cloud from water cloud
+- **Cloud-top height** rendered like a relief map
+- **Timelapse video** with pipelined downloads (~2.5× faster than serial)
+- **Watch mode** — a live Earth view that re-renders every 10 minutes
+- **Physically grounded**: per-pixel solar/view geometry, sun-angle
   normalization, view-dependent Rayleigh haze removal, sun-glint softening
-- 🎛️ Every knob in one file ([`src/tuning.rs`](src/tuning.rs))
+- Every knob in one file ([`src/tuning.rs`](src/tuning.rs))
 
 ## Quick start
 

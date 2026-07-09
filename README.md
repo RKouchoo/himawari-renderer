@@ -76,7 +76,7 @@ All images below were rendered by this tool from a single scene
 | `--out` | `earth.png` | output PNG path; other products land next to it as `<stem>_<product>.png` |
 | `--downsample` | `1` (video: `4`) | box-average factor on the 11000×11000 1 km grid (must divide 11000) |
 | `--threads` | all cores | rayon worker count |
-| `--cache-dir` | none | keep the downloaded `.DAT.bz2` files for re-runs |
+| `--cache-dir` | none | persistent download cache — files are never purged, so re-runs are free |
 | `--combined` | off | day/night sandwich product (`_combined.png`) |
 | `--combined-style` | `convection` | palette for the combined product's overlay |
 | `--natural` | off | natural-color composite (`_natural.png`) |
@@ -87,6 +87,7 @@ All images below were rendered by this tool from a single scene
 | `--fps` | `12` | timelapse frame rate |
 | `--follow-storm` | off | timelapse only: auto-track the strongest storm and crop every frame centered on it |
 | `--follow-size` | `2048` | side of the storm crop, in km |
+| `--follow-seed` | auto | start the tracker at `LAT,LON` instead of auto-picking the strongest storm |
 | `--watch` | off | keep running; re-render all requested products for each new scene |
 
 Full-disk scenes exist every 10 minutes except two daily housekeeping
@@ -130,14 +131,17 @@ standard limitation, kept honest.
 **Timelapse** (`--timelapse START..END`) renders one frame per scene
 (true color, or combined if `--combined` is given) and encodes with ffmpeg.
 Scenes are prefetched on concurrent pipeline threads; each scene's cache is
-purged as soon as it's assembled and the frame PNGs are removed after
-encoding, so a 25 GB six-hour run never holds more than a couple of GB on
-disk.
+purged as soon as it's assembled (only when using the internal fallback
+cache — a user-supplied `--cache-dir` is never touched) and the frame PNGs
+are removed after encoding, so an uncached six-hour run never holds more
+than a couple of GB on disk.
 
 **Storm follower** (`--follow-storm`, timelapse only) turns the frames into
 a storm-centered crop instead of the full disk: the tracker seeds on the
-largest cold-cloud mass on B13 (away from the limb and the winter pole),
-then follows it scene to scene with a bounded search and a smoothed
+largest cold-cloud mass on B13 (away from the limb and the winter pole), or
+on `--follow-seed LAT,LON` when several storms share the disk and you care
+about a specific one. It then follows scene to scene with a bounded search
+and a smoothed
 cold-centroid fix — the cyclone stays pinned mid-frame while the Earth
 slides behind it. `--follow-size` sets the crop in km; frames default to
 full 1 km resolution. Tracking thresholds are the `TRACK_*` constants in

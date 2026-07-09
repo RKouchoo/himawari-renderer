@@ -123,6 +123,46 @@ impl Geometry {
         ])
     }
 
+    /// Forward projection: geodetic latitude/longitude (degrees) to the
+    /// (fractional, 0-based) pixel position on this projection's grid.
+    /// None when the point is on the far side of the Earth.
+    pub fn grid_position(&self, lat_deg: f64, lon_deg: f64) -> Option<(f64, f64)> {
+        let geocentric_lat = (self.req2_over_rpol2.recip() * lat_deg.to_radians().tan()).atan();
+        let lon_rel = lon_deg.to_radians() - self.sub_lon;
+        // Geocentric radius of the ellipsoid at this latitude.
+        let eccentricity2 = 1.0 - self.req2_over_rpol2.recip();
+        let radius = self.polar_radius / (1.0 - eccentricity2 * geocentric_lat.cos().powi(2)).sqrt();
+
+        let point = [
+            radius * geocentric_lat.cos() * lon_rel.cos(),
+            radius * geocentric_lat.cos() * lon_rel.sin(),
+            radius * geocentric_lat.sin(),
+        ];
+        // Facing away from the satellite -> not visible.
+        let to_satellite = [
+            self.satellite_distance - point[0],
+            -point[1],
+            -point[2],
+        ];
+        if point[0] * to_satellite[0] + point[1] * to_satellite[1] + point[2] * to_satellite[2]
+            <= 0.0
+        {
+            return None;
+        }
+
+        // Direction from the satellite, back to scan angles and pixels
+        // (inverse of surface_point's convention).
+        let d = [point[0] - self.satellite_distance, point[1], point[2]];
+        let norm = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let dir = [d[0] / norm, d[1] / norm, d[2] / norm];
+        let y = (-dir[2]).asin();
+        let x = dir[1].atan2(-dir[0]);
+        Some((
+            x / self.col_scale + self.coff - 1.0,
+            y / self.line_scale + self.loff - 1.0,
+        ))
+    }
+
     /// Geometry at a (fractional, 0-based) pixel index of the grid this
     /// projection describes. None when the pixel looks past the Earth limb.
     pub fn angles(&self, col: f64, line: f64) -> Option<Angles> {

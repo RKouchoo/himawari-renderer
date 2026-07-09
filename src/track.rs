@@ -23,6 +23,14 @@ pub fn update(bt: &[f32], width: usize, previous: Option<Position>) -> Option<Po
     }
 }
 
+/// Lock onto the cold-cloud mass nearest a user-provided seed: an
+/// unsmoothed centroid fix (falling back to the seed itself), so the first
+/// frame is already centered instead of easing in over several frames.
+pub fn acquire(bt: &[f32], width: usize, seed: Position) -> Position {
+    let scale = width as f64 / FULL_DISK_SIZE as f64;
+    centroid(bt, width, (seed.0 * scale, seed.1 * scale)).unwrap_or(seed)
+}
+
 /// How storm-like one pixel is: kelvins below the cold threshold.
 fn weight(bt: f32) -> f64 {
     if bt.is_finite() {

@@ -54,7 +54,10 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
-    /// Directory for caching downloaded .DAT.bz2 files across runs.
+    /// Directory for caching downloaded .DAT.bz2 files. Persistent: files
+    /// here are never deleted, so re-runs over the same scenes are free.
+    /// (Timelapse without this flag uses a temporary cache that is purged
+    /// scene by scene to bound disk use.)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
@@ -112,7 +115,8 @@ struct Args {
 
     /// Keep running: poll the bucket and re-render every requested product
     /// to the same output paths whenever a new 10-minute scene appears.
-    /// With --cache-dir, each scene's cached files are purged after use.
+    /// Note: with --cache-dir, scenes accumulate (~100 GB/day) since caches
+    /// are persistent; omit it in watch mode unless you want the archive.
     #[arg(long)]
     watch: bool,
 
@@ -125,6 +129,24 @@ struct Args {
     /// Size of the --follow-storm crop, in kilometers (1 km grid pixels).
     #[arg(long, default_value_t = 2048)]
     follow_size: usize,
+
+    /// Seed the storm tracker at a position instead of auto-picking the
+    /// strongest storm: "LAT,LON" in degrees (south/west negative), e.g.
+    /// "26.4,128.9". The tracker locks onto the nearest cold-cloud mass.
+    #[arg(long, value_name = "LAT,LON", requires = "follow_storm", value_parser = parse_seed)]
+    follow_seed: Option<(f64, f64)>,
+}
+
+fn parse_seed(text: &str) -> Result<(f64, f64), String> {
+    let (lat, lon) = text
+        .split_once(',')
+        .ok_or_else(|| format!("expected LAT,LON, got {text:?}"))?;
+    let lat: f64 = lat.trim().parse().map_err(|_| format!("bad latitude {lat:?}"))?;
+    let lon: f64 = lon.trim().parse().map_err(|_| format!("bad longitude {lon:?}"))?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=360.0).contains(&lon) {
+        return Err("latitude must be -90..90, longitude -180..360".into());
+    }
+    Ok((lat, lon))
 }
 
 /// Shared multi-bar registry so bars from concurrent jobs stack cleanly.
@@ -434,6 +456,10 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
     ));
     std::fs::create_dir_all(&frames_dir)
         .with_context(|| format!("creating {}", frames_dir.display()))?;
+    // A user-supplied cache persists across runs (re-runs over the same
+    // range are free); only the internal fallback cache is purged scene by
+    // scene to bound disk use.
+    let user_cache = args.cache_dir.is_some();
     let cache_dir = args
         .cache_dir
         .clone()
@@ -471,7 +497,9 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
                 let Some(&slot) = slots.get(index) else { break };
                 let with_b13 = args.combined || args.follow_storm;
                 let scene = fetch_scene(agent, slot, with_b13, cache_dir);
-                purge_scene_cache(cache_dir, slot);
+                if !user_cache {
+                    purge_scene_cache(cache_dir, slot);
+                }
                 if sender.send((index, scene)).is_err() {
                     break; // the consumer bailed
                 }
@@ -499,6 +527,19 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
                         scene.b13.as_ref().context("storm following needs B13")?;
                     let bt = compose::brightness_grid(calibration, counts)
                         .context("B13 lacks thermal calibration")?;
+                    // A user seed replaces the automatic strongest-storm
+                    // search: start the track at that position and let the
+                    // centroid lock onto the nearest cold-cloud mass.
+                    if storm_track.is_none()
+                        && let Some((lat, lon)) = args.follow_seed
+                    {
+                        let find = |b: Band| scene.bands.iter().find(|i| i.band == b).unwrap();
+                        let geometry = geo::Geometry::new(&find(Band::B01).projection, scene.time);
+                        let seed = geometry.grid_position(lat, lon).with_context(|| {
+                            format!("--follow-seed {lat},{lon} is not visible from Himawari-9")
+                        })?;
+                        storm_track = Some(track::acquire(&bt, IrBand::WIDTH, seed));
+                    }
                     storm_track = track::update(&bt, IrBand::WIDTH, storm_track);
                     let position =
                         storm_track.context("no storm-like cold cloud found to follow")?;
@@ -575,12 +616,7 @@ fn run_watch(agent: &ureq::Agent, args: &Args, downsample: usize) -> Result<()> 
         match fetch::find_latest_scene(agent, &extra_bands, &ir_needed) {
             Ok(slot) if last_rendered != Some(slot) => {
                 match run_scene(agent, args, slot, downsample) {
-                    Ok(()) => {
-                        last_rendered = Some(slot);
-                        if let Some(cache) = &args.cache_dir {
-                            purge_scene_cache(cache, slot);
-                        }
-                    }
+                    Ok(()) => last_rendered = Some(slot),
                     Err(error) => {
                         status(format!("scene {} failed: {error:#}", slot.format("%H:%M")));
                     }

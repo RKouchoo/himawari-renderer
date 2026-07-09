@@ -329,6 +329,16 @@ fn download_range(agent: &ureq::Agent, url: &str, offset: u64, buf: &mut [u8]) -
     Err(last_err.unwrap()).with_context(|| format!("downloading {url} ({range}) failed after retries"))
 }
 
+/// Write a zstd cache entry atomically (temp file + rename), so an
+/// interrupted run can never leave a truncated entry behind.
+fn write_zstd_cache(path: &Path, raw: &[u8]) -> Result<()> {
+    let encoded = zstd::encode_all(raw, crate::tuning::CACHE_ZSTD_LEVEL)?;
+    let temp = path.with_extension("zst.tmp");
+    std::fs::write(&temp, encoded)?;
+    std::fs::rename(&temp, path)?;
+    Ok(())
+}
+
 fn read_exactly(mut reader: impl Read, buf: &mut [u8]) -> Result<()> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -342,6 +352,11 @@ fn read_exactly(mut reader: impl Read, buf: &mut [u8]) -> Result<()> {
 
 /// Download (or read from cache), decompress, and parse one segment,
 /// ticking the band's progress bar when done.
+///
+/// The bucket serves bzip2, which decodes slowly (~60 MB/s per core), so
+/// the cache stores segments recompressed as zstd: the bzip2 cost is paid
+/// exactly once per download, and cached re-reads decode an order of
+/// magnitude faster. Legacy `.bz2` cache entries are upgraded in place.
 pub fn fetch_segment<B: AhiBand>(
     agent: &ureq::Agent,
     time: DateTime<Utc>,
@@ -351,26 +366,42 @@ pub fn fetch_segment<B: AhiBand>(
     progress: &indicatif::ProgressBar,
 ) -> Result<hsd::Segment> {
     let name = file_name(time, band, segment);
-    let cache_path = cache_dir.map(|dir| dir.join(&name));
+    let zst_path = cache_dir.map(|dir| dir.join(name.replace(".bz2", ".zst")));
 
-    let compressed = match &cache_path {
-        Some(path) if path.is_file() => {
-            std::fs::read(path).with_context(|| format!("reading cached {}", path.display()))?
-        }
-        _ => {
-            let bytes = download(agent, &object_url(time, band, segment))?;
-            if let Some(path) = &cache_path {
-                std::fs::write(path, &bytes)
+    // Fast path: a zstd cache entry. A corrupt one (e.g. an interrupted
+    // earlier run) falls through to a fresh download.
+    let mut raw: Option<Vec<u8>> = None;
+    if let Some(path) = &zst_path
+        && path.is_file()
+        && let Ok(file) = std::fs::File::open(path)
+    {
+        raw = zstd::decode_all(std::io::BufReader::new(file)).ok();
+    }
+
+    let raw = match raw {
+        Some(raw) => raw,
+        None => {
+            // Legacy bzip2 cache entry, or a fresh download.
+            let legacy_path = cache_dir.map(|dir| dir.join(&name));
+            let compressed = match &legacy_path {
+                Some(path) if path.is_file() => std::fs::read(path)
+                    .with_context(|| format!("reading cached {}", path.display()))?,
+                _ => download(agent, &object_url(time, band, segment))?,
+            };
+            let mut raw = Vec::with_capacity(compressed.len() * 4);
+            MultiBzDecoder::new(compressed.as_slice())
+                .read_to_end(&mut raw)
+                .with_context(|| format!("decompressing {name}"))?;
+            if let Some(path) = &zst_path {
+                write_zstd_cache(path, &raw)
                     .with_context(|| format!("writing cache file {}", path.display()))?;
+                if let Some(legacy) = &legacy_path {
+                    let _ = std::fs::remove_file(legacy); // upgraded
+                }
             }
-            bytes
+            raw
         }
     };
-
-    let mut raw = Vec::with_capacity(compressed.len() * 4);
-    MultiBzDecoder::new(compressed.as_slice())
-        .read_to_end(&mut raw)
-        .with_context(|| format!("decompressing {name}"))?;
 
     let parsed = hsd::parse(&raw).with_context(|| format!("parsing {name}"))?;
     if parsed.band_number != band.number()

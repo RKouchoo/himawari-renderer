@@ -27,6 +27,11 @@ pub const DOWNLOAD_CONNECTIONS_PER_FILE: u64 = 4;
 /// bookkeeping is not worth it for small objects).
 pub const DOWNLOAD_SPLIT_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Cached segments are stored zstd-recompressed at this level: bzip2 (the
+/// bucket's format) decodes at ~60 MB/s per core, zstd at over 1 GB/s, so
+/// re-reading a cached scene is ~10x faster for ~40% more disk.
+pub const CACHE_ZSTD_LEVEL: i32 = 3;
+
 /// How many 10-minute slots to walk back from now when locating the latest
 /// complete scene (36 = 6 hours).
 pub const SCENE_LOOKBACK_SLOTS: usize = 36;

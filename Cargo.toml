@@ -14,6 +14,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 indicatif = "0.17"
 rayon = "1"
 ureq = "2"
+zstd = "0.13"
 
 [profile.release]
 lto = "thin"

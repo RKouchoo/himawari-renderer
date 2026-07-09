@@ -21,6 +21,8 @@ self-updating mode.
 - **Natural color** (1.6 µm) — separates ice cloud from water cloud
 - **Cloud-top height** rendered like a relief map
 - **Timelapse video** with pipelined downloads (~2.5× faster than serial)
+- **Storm follower** — timelapse frames auto-tracked and cropped on a
+  cyclone (auto-seeded, by lat/lon, or picked interactively)
 - **Watch mode** — a live Earth view that re-renders every 10 minutes
 - **Physically grounded**: per-pixel solar/view geometry, sun-angle
   normalization, view-dependent Rayleigh haze removal, sun-glint softening
@@ -45,6 +47,10 @@ cargo build --release
 # Six hours of Earth as a 12 fps video
 ./target/release/himawari-earth --timelapse 2026-07-09T00:00..2026-07-09T06:00
 
+# Three hours of a typhoon, tracked and cropped (see the demo below)
+./target/release/himawari-earth --timelapse 2026-07-09T02:00..2026-07-09T05:00 \
+    --follow-storm --follow-seed 24.5,125.5
+
 # A live view: re-renders whenever a new scene lands (every 10 minutes)
 ./target/release/himawari-earth --watch --downsample 4 --cache-dir ./cache
 ```
@@ -56,8 +62,8 @@ cargo build --release
 ## Gallery
 
 All images below were rendered by this tool from a single scene
-(2026-07-09 03:40 UTC). Full-resolution originals are in
-[`examples/`](examples/).
+(2026-07-09 03:40 UTC) and downsized for the page — the real outputs are
+up to 11000×11000.
 
 | | |
 |:---:|:---:|
@@ -79,7 +85,7 @@ All images below were rendered by this tool from a single scene
 | `--cache-dir` | none | persistent download cache — never purged, stored zstd-recompressed so re-runs decode ~15× faster than the bucket's bzip2 |
 | `--cache-only` | off | never download: render from the cache alone, skipping timelapse scenes that aren't fully cached; without `--time`, uses the newest fully-cached scene |
 | `--combined` | off | day/night combined product (`_combined.png`) |
-| `--combined-style` | `convection` | combined product's B13 layer: a cold-top palette, or `night-ir` (day untouched, night as a full IR render) |
+| `--combined-style` | `convection` | combined product's B13 layer: a cold-top palette, or `night-ir` (true-color day, full IR render at night) |
 | `--combined-clut-enable` | `true` | impose colorized cold cloud tops on the combined product; `false` leaves them plain (grayscale IR clouds for the palette styles, inverted-grayscale night side for `night-ir`) |
 | `--natural` | off | natural-color composite (`_natural.png`) |
 | `--cloud-height` | off | cloud-top height render (`_height.png`) |
@@ -108,9 +114,10 @@ view path's air mass, and sun-glint softening around the specular point.
 The night side is dark because these are reflected-light bands; that's real.
 
 **Combined** (`--combined`) imposes B13 (clean IR) over true color: cold
-cloud tops (< 235 K) are painted opaquely in the palette's colors day and
-night, and grayscale IR clouds fade in where the sun has set, so the night
-side shows weather instead of going black. The IR sample is
+cloud tops (< 235 K) are painted in the palette's colors day and night
+(opacity is the `SANDWICH_ALPHA` tunable), and grayscale IR clouds fade in
+where the sun has set, so the night side shows weather instead of going
+black. The IR sample is
 parallax-corrected using a cloud-top height estimate, keeping colored
 convection registered on its visible cloud toward the limb. With
 `--combined-style night-ir` the behavior changes mode: the night side
@@ -157,6 +164,13 @@ cold-centroid fix — the cyclone stays pinned mid-frame while the Earth
 slides behind it. `--follow-size` sets the crop in km; frames default to
 full 1 km resolution. Tracking thresholds are the `TRACK_*` constants in
 [`src/tuning.rs`](src/tuning.rs).
+
+<p align="center">
+  <img src="examples/previews/follow_typhoon.gif" width="55%" alt="Storm follower demo: a typhoon tracked over three hours, pinned mid-frame">
+</p>
+<p align="center"><sub>Three hours of a typhoon east of Taiwan (2026-07-09), tracked with
+<code>--follow-storm --follow-seed 24.5,125.5</code> — full video in
+<a href="examples/follow_typhoon.mp4"><code>examples/follow_typhoon.mp4</code></a>.</sub></p>
 
 **Watch** (`--watch`) polls the bucket and re-renders everything you asked
 for whenever a new scene finishes uploading — point `--out` at your

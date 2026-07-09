@@ -1,0 +1,18 @@
+[package]
+name = "himawari-earth"
+version = "0.1.0"
+edition = "2021"
+description = "Composite a true-color full-disk image of Earth from Himawari-9 AHI L1b data on AWS S3"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+bzip2 = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1"
+ureq = "2"
+
+[profile.release]
+lto = "thin"

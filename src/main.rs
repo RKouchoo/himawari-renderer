@@ -1,6 +1,6 @@
 //! himawari-earth: download Himawari-9 full-disk scenes from the public
 //! `noaa-himawari9` S3 bucket and render them — true color, natural color,
-//! IR enhancements, cloud-top height, a combined day/night sandwich
+//! IR enhancements, cloud-top height, a combined day/night
 //! product, and timelapse video.
 //!
 //! Every (band, segment) file is downloaded, decompressed, and parsed as a
@@ -79,15 +79,23 @@ struct Args {
 
     /// Also write <out-stem>_combined.png: the true-color composite with the
     /// B13 clean-IR band imposed on top. Cold cloud tops keep their CLUT
-    /// colors (a "sandwich" product) and night-side clouds show as grayscale
+    /// colors, imposed opaquely, and night-side clouds show as grayscale
     /// IR instead of going black.
     #[arg(long)]
     combined: bool,
 
-    /// Palette for the combined product's sandwich overlay (same choices as
-    /// --clut-style; the SANDWICH_* thresholds are tuned for convection).
-    #[arg(long, value_enum, default_value_t = compose::ClutStyle::Convection)]
-    combined_style: compose::ClutStyle,
+    /// Style of the combined product's B13 layer: the palette names paint
+    /// cold cloud tops day and night, while "night-ir" renders the night
+    /// side as a full convection-CLUT IR product (daylight stays true
+    /// color, plus the imposed cold tops when the CLUT is enabled).
+    #[arg(long, value_enum, default_value_t = compose::CombinedStyle::Convection)]
+    combined_style: compose::CombinedStyle,
+
+    /// Whether the combined product colorizes cold cloud tops with a CLUT
+    /// (true), or leaves them plain: grayscale IR clouds only for the
+    /// palette styles, inverted-grayscale night side for night-ir (false).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    combined_clut_enable: bool,
 
     /// Also write <out-stem>_natural.png: a natural-color composite with the
     /// 1.6 um band as red (snow/ice cyan, water cloud white, vegetation
@@ -375,6 +383,7 @@ fn run_scene(
             &geometry,
             Window::full_disk(downsample),
             args.combined_style,
+            args.combined_clut_enable,
         )?;
         save_png(&suffixed_output_path(&args.out, "combined"), image)?;
     }
@@ -778,6 +787,7 @@ fn render_scene_frame(
             &geometry,
             window,
             args.combined_style,
+            args.combined_clut_enable,
         )?
     } else {
         compose::true_color(

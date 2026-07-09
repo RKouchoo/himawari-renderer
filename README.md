@@ -64,7 +64,7 @@ All images below were rendered by this tool from a single scene
 | ![True color](examples/previews/true_color.jpg) | ![Natural color](examples/previews/natural_color.jpg) |
 | **True color** — what your eyes would see | **Natural color** (`--natural`) — ice cloud cyan, vegetation green |
 | ![Combined](examples/previews/combined_convection.jpg) | ![Cloud-top height](examples/previews/cloud_top_height.jpg) |
-| **Combined** (`--combined`) — day/night sandwich product | **Cloud-top height** (`--cloud-height`) — atmosphere as a relief map |
+| **Combined** (`--combined`) — day/night product with imposed cold tops | **Cloud-top height** (`--cloud-height`) — atmosphere as a relief map |
 | ![Water vapor](examples/previews/clut_water_vapor_B08.jpg) | ![Rainbow IR](examples/previews/clut_rainbow_B13.jpg) |
 | **Water vapor** (`--clut-bands 8 --clut-style water-vapor`) | **Rainbow IR** (`--clut-bands 13 --clut-style rainbow`) |
 
@@ -78,8 +78,9 @@ All images below were rendered by this tool from a single scene
 | `--threads` | all cores | rayon worker count |
 | `--cache-dir` | none | persistent download cache — never purged, stored zstd-recompressed so re-runs decode ~15× faster than the bucket's bzip2 |
 | `--cache-only` | off | never download: render from the cache alone, skipping timelapse scenes that aren't fully cached; without `--time`, uses the newest fully-cached scene |
-| `--combined` | off | day/night sandwich product (`_combined.png`) |
-| `--combined-style` | `convection` | palette for the combined product's overlay |
+| `--combined` | off | day/night combined product (`_combined.png`) |
+| `--combined-style` | `convection` | combined product's B13 layer: a cold-top palette, or `night-ir` (day untouched, night as a full IR render) |
+| `--combined-clut-enable` | `true` | impose colorized cold cloud tops on the combined product; `false` leaves them plain (grayscale IR clouds for the palette styles, inverted-grayscale night side for `night-ir`) |
 | `--natural` | off | natural-color composite (`_natural.png`) |
 | `--cloud-height` | off | cloud-top height render (`_height.png`) |
 | `--clut-bands` | none | thermal bands 7–16 (e.g. `13` or `B08,B13`) as standalone IR images (`_Bnn.png`) |
@@ -106,12 +107,19 @@ soft civil-twilight terminator), Rayleigh haze subtraction scaled by the
 view path's air mass, and sun-glint softening around the specular point.
 The night side is dark because these are reflected-light bands; that's real.
 
-**Combined** (`--combined`) blends B13 (clean IR) over true color: cold
-cloud tops (< 235 K) are painted in the palette's colors day and night — a
-"sandwich" product — and grayscale IR clouds fade in where the sun has set,
-so the night side shows weather instead of going black. The IR sample is
+**Combined** (`--combined`) imposes B13 (clean IR) over true color: cold
+cloud tops (< 235 K) are painted opaquely in the palette's colors day and
+night, and grayscale IR clouds fade in where the sun has set, so the night
+side shows weather instead of going black. The IR sample is
 parallax-corrected using a cloud-top height estimate, keeping colored
-convection registered on its visible cloud toward the limb.
+convection registered on its visible cloud toward the limb. With
+`--combined-style night-ir` the behavior changes mode: the night side
+becomes a full convection-CLUT IR render while daylight stays true color
+with the same imposed cold tops — the two base regimes split cleanly at the
+terminator and never overlap. `--combined-clut-enable false` drops the
+cold-top colorization from any combined style: the palette styles keep only
+their grayscale night clouds, night-ir's night side becomes plain grayscale
+IR, and daylight is untouched true color in both.
 
 **Natural color** (`--natural`) maps 1.6 µm/0.86 µm/0.64 µm to RGB. Ice
 absorbs at 1.6 µm, so snow and ice-topped cloud come out cyan while water

@@ -52,7 +52,7 @@ pub struct Rgb8Image {
 
 /// Which brightness-temperature palette to render with: `--clut-style` for
 /// the standalone `--clut-bands` images, `--combined-style` for the
-/// combined product's sandwich overlay. The `SANDWICH_*` thresholds are
+/// combined product's cold-top imposition. The `SANDWICH_*` thresholds are
 /// tuned to `Convection`'s cold ramp, so that is the default everywhere;
 /// other palettes simply recolor whatever the overlay paints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -71,6 +71,34 @@ impl ClutStyle {
             ClutStyle::Grayscale => CLUT_GRAYSCALE,
             ClutStyle::Rainbow => CLUT_RAINBOW,
             ClutStyle::WaterVapor => CLUT_WATER_VAPOR,
+        }
+    }
+}
+
+/// How the combined product uses B13. The palette variants paint cold
+/// cloud tops day and night; `NightIr` renders the night side as a full
+/// convection-CLUT IR product while daylight stays true color (with the
+/// same imposed cold tops when the CLUT is enabled) — the two base regimes
+/// never overlap, splitting cleanly at the terminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CombinedStyle {
+    #[default]
+    Convection,
+    Grayscale,
+    Rainbow,
+    WaterVapor,
+    NightIr,
+}
+
+impl CombinedStyle {
+    /// The cold-top palette, or None for the night-IR mode.
+    fn palette(self) -> Option<&'static [(f32, [f32; 3])]> {
+        match self {
+            CombinedStyle::Convection => Some(CLUT_CONVECTION),
+            CombinedStyle::Grayscale => Some(CLUT_GRAYSCALE),
+            CombinedStyle::Rainbow => Some(CLUT_RAINBOW),
+            CombinedStyle::WaterVapor => Some(CLUT_WATER_VAPOR),
+            CombinedStyle::NightIr => None,
         }
     }
 }
@@ -362,7 +390,7 @@ pub fn natural_color(
     })
 }
 
-/// Composite the true-color image with the B13 clean-IR band: a sandwich
+/// Composite the true-color image with the B13 clean-IR band: imposed
 /// product where cold cloud tops keep their CLUT colors on top of the
 /// visible imagery, and the night side of the disk shows IR clouds in
 /// grayscale instead of going black.
@@ -377,7 +405,8 @@ pub fn combined(
     ir_width: usize,
     geometry: &Geometry,
     window: Window,
-    style: ClutStyle,
+    style: CombinedStyle,
+    clut_enable: bool,
 ) -> Result<Rgb8Image> {
     // Precompute the brightness-temperature grid once so the per-pixel work
     // is a bilinear sample instead of a Planck inversion.
@@ -385,6 +414,9 @@ pub fn combined(
         .context("combined product needs a thermal band")?;
     // One IR pixel spans this many 1 km grid pixels (2 for the 2 km B13).
     let ir_scale = FULL_DISK_SIZE as f32 / ir_width as f32;
+    // Night-IR mode's palette: colored cold ramp, or plain inverted
+    // grayscale when the CLUT toggle is off.
+    let night_table = if clut_enable { CLUT_CONVECTION } else { CLUT_GRAYSCALE };
 
     render_disk([red, green, blue, nir], geometry, window, |px| {
         let mut pixel = tone_map(correct(hybrid_rgb(px.rgbn), &px.angles));
@@ -421,6 +453,28 @@ pub fn combined(
             return pixel;
         }
 
+        let Some(palette) = style.palette() else {
+            // Night-IR mode: the night side cross-fades into a full IR
+            // render. The daylight factor gates the blend, so it can never
+            // overlap the sunlit disk, and the limb damp keeps limb cooling
+            // from painting false colors along the edge.
+            let night = (1.0 - daylight(px.angles.cos_sun)) * limb_fade(px.col, px.line);
+            if night > 0.0 {
+                let ir = clut_color(night_table, bt).map(|c| f32::from(c) / 255.0);
+                for (channel, ir_channel) in pixel.iter_mut().zip(ir) {
+                    *channel = *channel * (1.0 - night) + ir_channel * night;
+                }
+            }
+            // With the CLUT enabled the daylight true color gets the
+            // colorized cold tops too; on the night side this repaints the
+            // color the IR render already gave, so the regimes stay
+            // seamless at the terminator.
+            if clut_enable {
+                impose_cold_top(&mut pixel, bt, CLUT_CONVECTION, px.col, px.line);
+            }
+            return pixel;
+        };
+
         // Night side: fade in grayscale IR clouds as the sun sets.
         let night = 1.0 - daylight(px.angles.cos_sun);
         if night > 0.0 {
@@ -430,25 +484,34 @@ pub fn combined(
             }
         }
 
-        // Sandwich overlay: CLUT colors for cold convective tops, faded out
-        // at the limb where B13 reads falsely cold.
-        if bt < SANDWICH_START {
-            let half = FULL_DISK_SIZE as f32 / 2.0;
-            let dx = (px.col as f32 + 0.5) - half;
-            let dy = (px.line as f32 + 0.5) - half;
-            let radius = (dx * dx + dy * dy).sqrt() / half;
-            let limb =
-                1.0 - smoothstep(((radius - LIMB_FADE_START) / LIMB_FADE_WIDTH).clamp(0.0, 1.0));
-            let alpha =
-                ((SANDWICH_START - bt) / SANDWICH_RAMP).clamp(0.0, 1.0) * SANDWICH_ALPHA * limb;
-            let clut = clut_color(style.table(), bt).map(|c| f32::from(c) / 255.0);
-            for (channel, overlay) in pixel.iter_mut().zip(clut) {
-                *channel = *channel * (1.0 - alpha) + overlay * alpha;
-            }
+        if clut_enable {
+            impose_cold_top(&mut pixel, bt, palette, px.col, px.line);
         }
 
         pixel
     })
+}
+
+/// Cold-top imposition: paint the palette's color over a cold convective
+/// top, opaque past the short anti-aliasing ramp below SANDWICH_START, and
+/// faded out at the limb where B13 reads falsely cold.
+fn impose_cold_top(
+    pixel: &mut [f32; 3],
+    bt: f32,
+    palette: &[(f32, [f32; 3])],
+    col: f64,
+    line: f64,
+) {
+    if bt >= SANDWICH_START {
+        return;
+    }
+    let alpha = ((SANDWICH_START - bt) / SANDWICH_RAMP).clamp(0.0, 1.0)
+        * SANDWICH_ALPHA
+        * limb_fade(col, line);
+    let clut = clut_color(palette, bt).map(|c| f32::from(c) / 255.0);
+    for (channel, overlay) in pixel.iter_mut().zip(clut) {
+        *channel = *channel * (1.0 - alpha) + overlay * alpha;
+    }
 }
 
 /// Brightness-temperature grid for a thermal band (NaN for invalid pixels).
@@ -627,6 +690,16 @@ fn quantize(rgb: [f32; 3]) -> [u8; 3] {
 
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
+}
+
+/// 1 across the disk, rolling to 0 at the extreme limb, where the long
+/// slant path makes B13 read falsely cold ("limb cooling").
+fn limb_fade(col: f64, line: f64) -> f32 {
+    let half = FULL_DISK_SIZE as f32 / 2.0;
+    let dx = (col as f32 + 0.5) - half;
+    let dy = (line as f32 + 0.5) - half;
+    let radius = (dx * dx + dy * dy).sqrt() / half;
+    1.0 - smoothstep(((radius - LIMB_FADE_START) / LIMB_FADE_WIDTH).clamp(0.0, 1.0))
 }
 
 /// Bilinear sample of a grid at fractional pixel-center coordinates,

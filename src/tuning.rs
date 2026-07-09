@@ -239,12 +239,13 @@ pub const SPACE_BT_CUTOFF: f32 = 160.0;
 pub const NIGHT_IR_WARM: f32 = 290.0;
 pub const NIGHT_IR_COLD: f32 = 200.0;
 
-/// Sandwich overlay: cold cloud tops get their CLUT color starting at
+/// Cold-top imposition: cold cloud tops get their CLUT color starting at
 /// SANDWICH_START, reaching SANDWICH_ALPHA opacity SANDWICH_RAMP kelvin
-/// colder — day and night alike. SANDWICH_START sits below the CLUT's 240 K
+/// colder — day and night alike. At 1.0 the color is imposed opaquely over
+/// the true color rather than sandwich-blended with it; the ramp then only
+/// anti-aliases the boundary. SANDWICH_START sits below the CLUT's 240 K
 /// color threshold on purpose: it filters out marginal pixels that barely
-/// enter the cold ramp, so only genuinely convective tops are painted, and
-/// the ones that qualify are painted vividly.
+/// enter the cold ramp, so only genuinely convective tops are painted.
 pub const SANDWICH_START: f32 = 235.0;
 pub const SANDWICH_RAMP: f32 = 4.0;
 pub const SANDWICH_ALPHA: f32 = 0.85;

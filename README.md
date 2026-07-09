@@ -142,7 +142,10 @@ wallpaper directory and you have a live Earth.
    from now until a scene has every file the run needs (scenes upload file
    by file, so probing a single object isn't enough).
 2. **Fetch** — each of the 40–60 `.DAT.bz2` files (10 segments × bands) is
-   downloaded, bzip2-decompressed, and parsed as a parallel task.
+   downloaded, bzip2-decompressed, and parsed as a parallel task, and every
+   large file is itself split into byte ranges fetched on concurrent
+   connections (`DOWNLOAD_CONNECTIONS_PER_FILE`), lifting S3's
+   per-connection throughput cap.
 3. **Parse** — the JMA Himawari Standard Data (HSD) binary format: header
    blocks for data geometry, radiometric calibration, projection, and
    segment placement, then the 16-bit count raster.

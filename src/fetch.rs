@@ -11,7 +11,10 @@ use bzip2::read::MultiBzDecoder;
 use chrono::{DateTime, Duration, DurationRound, Utc};
 
 use crate::hsd;
-use crate::tuning::{CONNECT_TIMEOUT_SECS, DOWNLOAD_RETRIES, READ_TIMEOUT_SECS, SCENE_LOOKBACK_SLOTS};
+use crate::tuning::{
+    CONNECT_TIMEOUT_SECS, DOWNLOAD_CONNECTIONS_PER_FILE, DOWNLOAD_RETRIES,
+    DOWNLOAD_SPLIT_MIN_BYTES, READ_TIMEOUT_SECS, SCENE_LOOKBACK_SLOTS,
+};
 
 const BUCKET_URL: &str = "https://noaa-himawari9.s3.amazonaws.com";
 pub const SEGMENTS_PER_DISK: u8 = 10;
@@ -221,25 +224,50 @@ pub fn find_latest_scene(
     );
 }
 
+/// Download one object, splitting large files into byte ranges fetched on
+/// DOWNLOAD_CONNECTIONS_PER_FILE concurrent connections. Files are already
+/// parallel with each other; the split lifts the per-connection throughput
+/// cap on each individual object as well.
 fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
+    let length = object_length(agent, url)?;
+    if DOWNLOAD_CONNECTIONS_PER_FILE <= 1 || length < DOWNLOAD_SPLIT_MIN_BYTES {
+        return download_whole(agent, url, length as usize);
+    }
+
+    let mut buffer = vec![0u8; length as usize];
+    let range_len = length.div_ceil(DOWNLOAD_CONNECTIONS_PER_FILE) as usize;
+    std::thread::scope(|scope| -> Result<()> {
+        let workers: Vec<_> = buffer
+            .chunks_mut(range_len)
+            .enumerate()
+            .map(|(index, slice)| {
+                let offset = (index * range_len) as u64;
+                scope.spawn(move || download_range(agent, url, offset, slice))
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("download worker panicked")?;
+        }
+        Ok(())
+    })?;
+    Ok(buffer)
+}
+
+/// Object size from a HEAD request. Fails fast on missing objects: a slot
+/// that is not in the bucket will not appear on retry.
+fn object_length(agent: &ureq::Agent, url: &str) -> Result<u64> {
     let mut last_err = None;
     for attempt in 0..DOWNLOAD_RETRIES {
         if attempt > 0 {
             std::thread::sleep(StdDuration::from_secs(2 << attempt));
         }
-        match agent.get(url).call() {
+        match agent.head(url).call() {
             Ok(response) => {
-                let capacity = response
+                return response
                     .header("Content-Length")
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(32 << 20);
-                let mut body = Vec::with_capacity(capacity);
-                match response.into_reader().read_to_end(&mut body) {
-                    Ok(_) => return Ok(body),
-                    Err(e) => last_err = Some(anyhow::Error::from(e)),
-                }
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .with_context(|| format!("{url}: response carries no Content-Length"));
             }
-            // A missing object will not appear on retry; fail fast.
             Err(e @ ureq::Error::Status(403 | 404, _)) => {
                 return Err(anyhow::Error::from(e)).with_context(|| {
                     format!(
@@ -251,7 +279,65 @@ fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
             Err(e) => last_err = Some(anyhow::Error::from(e)),
         }
     }
+    Err(last_err.unwrap()).with_context(|| format!("probing {url} failed after retries"))
+}
+
+fn download_whole(agent: &ureq::Agent, url: &str, capacity: usize) -> Result<Vec<u8>> {
+    let mut last_err = None;
+    for attempt in 0..DOWNLOAD_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(StdDuration::from_secs(2 << attempt));
+        }
+        match agent.get(url).call() {
+            Ok(response) => {
+                let mut body = Vec::with_capacity(capacity);
+                match response.into_reader().read_to_end(&mut body) {
+                    Ok(_) => return Ok(body),
+                    Err(e) => last_err = Some(anyhow::Error::from(e)),
+                }
+            }
+            Err(e) => last_err = Some(anyhow::Error::from(e)),
+        }
+    }
     Err(last_err.unwrap()).with_context(|| format!("downloading {url} failed after retries"))
+}
+
+/// Fetch one byte range into its slice of the shared buffer.
+fn download_range(agent: &ureq::Agent, url: &str, offset: u64, buf: &mut [u8]) -> Result<()> {
+    let range = format!("bytes={}-{}", offset, offset + buf.len() as u64 - 1);
+    let mut last_err = None;
+    for attempt in 0..DOWNLOAD_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(StdDuration::from_secs(2 << attempt));
+        }
+        match agent.get(url).set("Range", &range).call() {
+            Ok(response) if response.status() == 206 => {
+                match read_exactly(response.into_reader(), buf) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Ok(response) => {
+                last_err = Some(anyhow::anyhow!(
+                    "expected 206 Partial Content, got {}",
+                    response.status(),
+                ));
+            }
+            Err(e) => last_err = Some(anyhow::Error::from(e)),
+        }
+    }
+    Err(last_err.unwrap()).with_context(|| format!("downloading {url} ({range}) failed after retries"))
+}
+
+fn read_exactly(mut reader: impl Read, buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => bail!("connection closed after {filled} of {} bytes", buf.len()),
+            n => filled += n,
+        }
+    }
+    Ok(())
 }
 
 /// Download (or read from cache), decompress, and parse one segment.

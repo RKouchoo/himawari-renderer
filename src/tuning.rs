@@ -16,6 +16,17 @@ pub const DOWNLOAD_RETRIES: u32 = 3;
 pub const CONNECT_TIMEOUT_SECS: u64 = 15;
 pub const READ_TIMEOUT_SECS: u64 = 120;
 
+/// Concurrent range-request connections per file. Files are already
+/// downloaded in parallel with each other; this additionally splits each
+/// file into byte ranges fetched on separate connections, so a single
+/// object is not capped by S3's per-connection throughput. 1 disables
+/// splitting.
+pub const DOWNLOAD_CONNECTIONS_PER_FILE: u64 = 4;
+
+/// Files smaller than this download on a single connection (the range
+/// bookkeeping is not worth it for small objects).
+pub const DOWNLOAD_SPLIT_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
 /// How many 10-minute slots to walk back from now when locating the latest
 /// complete scene (36 = 6 hours).
 pub const SCENE_LOOKBACK_SLOTS: usize = 36;

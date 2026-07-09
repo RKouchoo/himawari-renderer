@@ -11,6 +11,7 @@ mod compose;
 mod fetch;
 mod geo;
 mod hsd;
+mod track;
 mod tuning;
 
 use std::collections::HashMap;
@@ -28,7 +29,7 @@ use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-use compose::{BandImage, FULL_DISK_SIZE};
+use compose::{BandImage, Window, FULL_DISK_SIZE};
 use fetch::{Band, IrBand, SEGMENTS_PER_DISK};
 
 #[derive(Parser, Debug)]
@@ -114,6 +115,16 @@ struct Args {
     /// With --cache-dir, each scene's cached files are purged after use.
     #[arg(long)]
     watch: bool,
+
+    /// In --timelapse mode: automatically track the strongest storm (the
+    /// largest cold-cloud mass on B13) and crop every frame centered on it,
+    /// keeping the cyclone pinned while the Earth moves behind it.
+    #[arg(long, requires = "timelapse")]
+    follow_storm: bool,
+
+    /// Size of the --follow-storm crop, in kilometers (1 km grid pixels).
+    #[arg(long, default_value_t = 2048)]
+    follow_size: usize,
 }
 
 /// Shared multi-bar registry so bars from concurrent jobs stack cleanly.
@@ -303,7 +314,7 @@ fn run_scene(
         find(Band::B01),
         find(Band::B04),
         &geometry,
-        downsample,
+        Window::full_disk(downsample),
     )?;
     save_png(&args.out, image)?;
 
@@ -317,7 +328,7 @@ fn run_scene(
             counts,
             IrBand::WIDTH,
             &geometry,
-            downsample,
+            Window::full_disk(downsample),
             args.combined_style,
         )?;
         save_png(&suffixed_output_path(&args.out, "combined"), image)?;
@@ -329,7 +340,7 @@ fn run_scene(
             find(Band::B04),
             find(Band::B03),
             &geometry,
-            downsample,
+            Window::full_disk(downsample),
         )?;
         save_png(&suffixed_output_path(&args.out, "natural"), image)?;
     }
@@ -378,12 +389,22 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
     if !(1..=120).contains(&args.fps) {
         bail!("--fps must be between 1 and 120");
     }
-    let downsample = args.downsample.unwrap_or(tuning::TIMELAPSE_DOWNSAMPLE);
-    let frame_size = FULL_DISK_SIZE / downsample;
+    // A storm crop is small, so full resolution is the natural default there.
+    let downsample = args
+        .downsample
+        .unwrap_or(if args.follow_storm { 1 } else { tuning::TIMELAPSE_DOWNSAMPLE });
+    let frame_size = if args.follow_storm {
+        if !args.follow_size.is_multiple_of(downsample) || args.follow_size > FULL_DISK_SIZE {
+            bail!("--follow-size must be a multiple of --downsample, at most {FULL_DISK_SIZE}");
+        }
+        args.follow_size / downsample
+    } else {
+        FULL_DISK_SIZE / downsample
+    };
     if !frame_size.is_multiple_of(2) || frame_size > 5_500 {
         bail!(
-            "--downsample {downsample} gives {frame_size}x{frame_size} frames; video needs even \
-             dimensions of at most 5500 (try 4, 5, or 10)"
+            "{frame_size}x{frame_size} frames won't encode; video needs even dimensions of at \
+             most 5500 (adjust --downsample / --follow-size)"
         );
     }
     if Command::new("ffmpeg")
@@ -448,7 +469,8 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
             scope.spawn(move || loop {
                 let index = next_slot.fetch_add(1, Ordering::SeqCst);
                 let Some(&slot) = slots.get(index) else { break };
-                let scene = fetch_scene(agent, slot, args.combined, cache_dir);
+                let with_b13 = args.combined || args.follow_storm;
+                let scene = fetch_scene(agent, slot, with_b13, cache_dir);
                 purge_scene_cache(cache_dir, slot);
                 if sender.send((index, scene)).is_err() {
                     break; // the consumer bailed
@@ -459,6 +481,7 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
 
         let mut out_of_order: HashMap<usize, Result<Scene>> = HashMap::new();
         let mut rendered = 0usize;
+        let mut storm_track: Option<track::Position> = None;
         for expected in 0..slots.len() {
             let scene = loop {
                 if let Some(scene) = out_of_order.remove(&expected) {
@@ -470,8 +493,21 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
                 out_of_order.insert(index, scene);
             };
             let frame_path = frames_dir.join(format!("frame_{:05}.png", rendered + 1));
-            let outcome =
-                scene.and_then(|scene| render_scene_frame(&scene, args, downsample, &frame_path));
+            let outcome = scene.and_then(|scene| {
+                let window = if args.follow_storm {
+                    let (calibration, _, counts) =
+                        scene.b13.as_ref().context("storm following needs B13")?;
+                    let bt = compose::brightness_grid(calibration, counts)
+                        .context("B13 lacks thermal calibration")?;
+                    storm_track = track::update(&bt, IrBand::WIDTH, storm_track);
+                    let position =
+                        storm_track.context("no storm-like cold cloud found to follow")?;
+                    Window::centered(position, args.follow_size, downsample)
+                } else {
+                    Window::full_disk(downsample)
+                };
+                render_scene_frame(&scene, args, window, &frame_path)
+            });
             match outcome {
                 Ok(()) => {
                     rendered += 1;
@@ -607,12 +643,14 @@ fn fetch_scene(
 fn render_scene_frame(
     scene: &Scene,
     args: &Args,
-    downsample: usize,
+    window: Window,
     frame_path: &Path,
 ) -> Result<()> {
     let find = |band: Band| scene.bands.iter().find(|b| b.band == band).unwrap();
     let geometry = geo::Geometry::new(&find(Band::B01).projection, scene.time);
-    let image = if let Some((calibration, _, counts)) = &scene.b13 {
+    // B13 rides along for tracking even without --combined; only --combined
+    // blends it into the frame.
+    let image = if let (Some((calibration, _, counts)), true) = (&scene.b13, args.combined) {
         compose::combined(
             find(Band::B03),
             find(Band::B02),
@@ -622,7 +660,7 @@ fn render_scene_frame(
             counts,
             IrBand::WIDTH,
             &geometry,
-            downsample,
+            window,
             args.combined_style,
         )?
     } else {
@@ -632,7 +670,7 @@ fn render_scene_frame(
             find(Band::B01),
             find(Band::B04),
             &geometry,
-            downsample,
+            window,
         )?
     };
     // The frames bar tracks progress; a status line per frame would be noise.

@@ -85,6 +85,8 @@ All images below were rendered by this tool from a single scene
 | `--clut-style` | `convection` | palette for those IR images: `convection`, `grayscale`, `rainbow`, `water-vapor` |
 | `--timelapse` | off | `START..END` UTC range rendered to `<stem>.mp4` (requires ffmpeg) |
 | `--fps` | `12` | timelapse frame rate |
+| `--follow-storm` | off | timelapse only: auto-track the strongest storm and crop every frame centered on it |
+| `--follow-size` | `2048` | side of the storm crop, in km |
 | `--watch` | off | keep running; re-render all requested products for each new scene |
 
 Full-disk scenes exist every 10 minutes except two daily housekeeping
@@ -131,6 +133,15 @@ Scenes are prefetched on concurrent pipeline threads; each scene's cache is
 purged as soon as it's assembled and the frame PNGs are removed after
 encoding, so a 25 GB six-hour run never holds more than a couple of GB on
 disk.
+
+**Storm follower** (`--follow-storm`, timelapse only) turns the frames into
+a storm-centered crop instead of the full disk: the tracker seeds on the
+largest cold-cloud mass on B13 (away from the limb and the winter pole),
+then follows it scene to scene with a bounded search and a smoothed
+cold-centroid fix — the cyclone stays pinned mid-frame while the Earth
+slides behind it. `--follow-size` sets the crop in km; frames default to
+full 1 km resolution. Tracking thresholds are the `TRACK_*` constants in
+[`src/tuning.rs`](src/tuning.rs).
 
 **Watch** (`--watch`) polls the bucket and re-renders everything you asked
 for whenever a new scene finishes uploading — point `--out` at your

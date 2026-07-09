@@ -197,10 +197,46 @@ fn double_counts(counts: &[u16], width: usize) -> Vec<u16> {
 // Shared per-pixel scaffold
 // ---------------------------------------------------------------------------
 
+/// The portion of the 1 km disk grid a render covers: the full disk, or a
+/// crop (e.g. the storm follower's window).
+#[derive(Debug, Clone, Copy)]
+pub struct Window {
+    /// Top-left corner on the 1 km grid, in pixels.
+    pub origin: (usize, usize),
+    /// Output image width/height, in output pixels.
+    pub size: usize,
+    /// Box-average factor (output pixel = factor x factor grid pixels).
+    pub factor: usize,
+}
+
+impl Window {
+    pub fn full_disk(factor: usize) -> Window {
+        Window {
+            origin: (0, 0),
+            size: FULL_DISK_SIZE / factor,
+            factor,
+        }
+    }
+
+    /// A crop of `span` 1 km grid pixels centered on a grid position,
+    /// clamped to stay on the disk.
+    pub fn centered(center: (f64, f64), span: usize, factor: usize) -> Window {
+        let span = span.min(FULL_DISK_SIZE);
+        let clamp = |c: f64| {
+            (c - span as f64 / 2.0)
+                .round()
+                .clamp(0.0, (FULL_DISK_SIZE - span) as f64) as usize
+        };
+        Window {
+            origin: (clamp(center.0), clamp(center.1)),
+            size: span / factor,
+            factor,
+        }
+    }
+}
+
 /// Everything a product's shader gets to see for one output pixel.
 struct PixelSample {
-    out_x: usize,
-    out_y: usize,
     /// Fractional 0-based coordinates of the pixel center on the 1 km grid.
     col: f64,
     line: f64,
@@ -211,20 +247,22 @@ struct PixelSample {
 }
 
 /// The parallel walk every RGB disk product shares: box-average the four
-/// bands over `factor` x `factor` blocks, look up the pixel's geometry, and
-/// hand the result to a product-specific shader that returns display-space
-/// RGB (0..1). Space, missing-data, and past-the-limb pixels stay black.
+/// bands over `factor` x `factor` blocks of the window, look up the pixel's
+/// geometry, and hand the result to a product-specific shader that returns
+/// display-space RGB (0..1). Space, missing-data, and past-the-limb pixels
+/// stay black.
 fn render_disk<F>(
     bands: [&BandImage; 4],
     geometry: &Geometry,
-    factor: usize,
+    window: Window,
     shader: F,
 ) -> Result<Rgb8Image>
 where
     F: Fn(&PixelSample) -> [f32; 3] + Sync,
 {
-    debug_assert!(factor >= 1 && FULL_DISK_SIZE.is_multiple_of(factor));
-    let out_size = FULL_DISK_SIZE / factor;
+    let Window { origin, size: out_size, factor } = window;
+    debug_assert!(factor >= 1 && origin.0 + out_size * factor <= FULL_DISK_SIZE);
+    debug_assert!(origin.1 + out_size * factor <= FULL_DISK_SIZE);
 
     let lut = |band: &BandImage| {
         band.calibration
@@ -241,7 +279,9 @@ where
                 let mut sum = [0f32; 4];
                 let mut valid = 0u32;
                 for sub_y in 0..factor {
-                    let row_base = (out_y * factor + sub_y) * FULL_DISK_SIZE + out_x * factor;
+                    let row_base = (origin.1 + out_y * factor + sub_y) * FULL_DISK_SIZE
+                        + origin.0
+                        + out_x * factor;
                     for sub_x in 0..factor {
                         let i = row_base + sub_x;
                         let sample = [
@@ -261,15 +301,13 @@ where
                 if valid == 0 {
                     continue;
                 }
-                let col = (out_x as f64 + 0.5) * factor as f64 - 0.5;
-                let line = (out_y as f64 + 0.5) * factor as f64 - 0.5;
+                let col = origin.0 as f64 + (out_x as f64 + 0.5) * factor as f64 - 0.5;
+                let line = origin.1 as f64 + (out_y as f64 + 0.5) * factor as f64 - 0.5;
                 let Some(angles) = geometry.angles(col, line) else {
                     continue; // looks past the limb: leave black
                 };
                 let inv = 1.0 / valid as f32;
                 let pixel = shader(&PixelSample {
-                    out_x,
-                    out_y,
                     col,
                     line,
                     rgbn: sum.map(|v| v * inv),
@@ -290,18 +328,17 @@ where
 // Products
 // ---------------------------------------------------------------------------
 
-/// Composite the four bands into a gamma-encoded true-color image,
-/// box-averaging `factor` x `factor` blocks of the 1 km grid per output
-/// pixel. Space and missing pixels come out black.
+/// Composite the four bands into a gamma-encoded true-color image over the
+/// given window. Space and missing pixels come out black.
 pub fn true_color(
     red: &BandImage,
     green: &BandImage,
     blue: &BandImage,
     nir: &BandImage,
     geometry: &Geometry,
-    factor: usize,
+    window: Window,
 ) -> Result<Rgb8Image> {
-    render_disk([red, green, blue, nir], geometry, factor, |px| {
+    render_disk([red, green, blue, nir], geometry, window, |px| {
         tone_map(correct(hybrid_rgb(px.rgbn), &px.angles))
     })
 }
@@ -317,9 +354,9 @@ pub fn natural_color(
     nir: &BandImage,
     red: &BandImage,
     geometry: &Geometry,
-    factor: usize,
+    window: Window,
 ) -> Result<Rgb8Image> {
-    render_disk([swir, nir, red, red], geometry, factor, |px| {
+    render_disk([swir, nir, red, red], geometry, window, |px| {
         let [s, n, r, _] = px.rgbn;
         tone_map(correct([s, n, r], &px.angles))
     })
@@ -339,25 +376,24 @@ pub fn combined(
     ir_counts: &[u16],
     ir_width: usize,
     geometry: &Geometry,
-    factor: usize,
+    window: Window,
     style: ClutStyle,
 ) -> Result<Rgb8Image> {
     // Precompute the brightness-temperature grid once so the per-pixel work
     // is a bilinear sample instead of a Planck inversion.
-    let bt_lut = ir_calibration
-        .brightness_temperature_lut()
+    let bt_grid = brightness_grid(ir_calibration, ir_counts)
         .context("combined product needs a thermal band")?;
-    let bt_grid: Vec<f32> = ir_counts.iter().map(|&c| bt_lut[c as usize]).collect();
     // One IR pixel spans this many 1 km grid pixels (2 for the 2 km B13).
     let ir_scale = FULL_DISK_SIZE as f32 / ir_width as f32;
 
-    render_disk([red, green, blue, nir], geometry, factor, |px| {
+    render_disk([red, green, blue, nir], geometry, window, |px| {
         let mut pixel = tone_map(correct(hybrid_rgb(px.rgbn), &px.angles));
 
-        // IR coordinate of this output pixel's center.
-        let center = (px.out_x as f32 + 0.5) * factor as f32;
+        // IR coordinate of this output pixel's center (px.col is the center
+        // minus half a grid pixel).
+        let center = px.col as f32 + 0.5;
         let ir_x = center / ir_scale - 0.5;
-        let ir_y = ((px.out_y as f32 + 0.5) * factor as f32) / ir_scale - 0.5;
+        let ir_y = (px.line as f32 + 0.5) / ir_scale - 0.5;
         let mut bt = sample_bilinear(&bt_grid, ir_width, ir_x, ir_y);
         // Parallax: a tall cloud top appears displaced away from the
         // sub-satellite point, so this pixel's cloud lives elsewhere in the
@@ -398,8 +434,8 @@ pub fn combined(
         // at the limb where B13 reads falsely cold.
         if bt < SANDWICH_START {
             let half = FULL_DISK_SIZE as f32 / 2.0;
-            let dx = (px.out_x as f32 + 0.5) * factor as f32 - half;
-            let dy = (px.out_y as f32 + 0.5) * factor as f32 - half;
+            let dx = (px.col as f32 + 0.5) - half;
+            let dy = (px.line as f32 + 0.5) - half;
             let radius = (dx * dx + dy * dy).sqrt() / half;
             let limb =
                 1.0 - smoothstep(((radius - LIMB_FADE_START) / LIMB_FADE_WIDTH).clamp(0.0, 1.0));
@@ -413,6 +449,13 @@ pub fn combined(
 
         pixel
     })
+}
+
+/// Brightness-temperature grid for a thermal band (NaN for invalid pixels).
+/// None if the band has no thermal calibration.
+pub fn brightness_grid(calibration: &Calibration, counts: &[u16]) -> Option<Vec<f32>> {
+    let lut = calibration.brightness_temperature_lut()?;
+    Some(counts.iter().map(|&c| lut[c as usize]).collect())
 }
 
 /// Render an assembled thermal band through a brightness-temperature CLUT

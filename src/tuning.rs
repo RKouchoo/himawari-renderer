@@ -47,6 +47,34 @@ pub const TIMELAPSE_DOWNSAMPLE: usize = 4;
 /// multiplier — at the cost of ~1 GB of RAM per scene in flight.
 pub const TIMELAPSE_PREFETCH: usize = 2;
 
+// ---------------------------------------------------------------------------
+// Storm tracking (--follow-storm)
+// ---------------------------------------------------------------------------
+
+/// B13 brightness temperatures below this count as "storm cloud" for the
+/// tracker; the weight of a pixel is how far below it sits.
+pub const TRACK_COLD_THRESHOLD: f32 = 225.0;
+
+/// Sliding-window size, in 2 km B13 pixels, used to seed the track on the
+/// first frame: the window with the greatest cold-cloud weight wins.
+pub const TRACK_SEED_WINDOW: usize = 256;
+
+/// Seeding ignores pixels beyond this normalized disk radius, excluding
+/// limb-cooling artifacts and the wintertime polar surface.
+pub const TRACK_SEED_MAX_RADIUS: f64 = 0.8;
+
+/// Frame-to-frame search radius around the previous position, in 2 km
+/// pixels (150 px = 300 km; cyclones drift a few km per 10-minute slot).
+pub const TRACK_SEARCH_RADIUS: usize = 150;
+
+/// Minimum total cold weight (kelvin-below-threshold summed over pixels)
+/// for a fix; below this the tracker holds its previous position.
+pub const TRACK_MIN_WEIGHT: f64 = 500.0;
+
+/// Blend factor for each new fix (1 = jump straight to it, small = heavy
+/// smoothing). Keeps the crop from jittering.
+pub const TRACK_SMOOTHING: f64 = 0.35;
+
 /// x264 constant rate factor for the encoded video (lower = better/larger;
 /// 18 is visually lossless for most content).
 pub const VIDEO_CRF: u32 = 18;

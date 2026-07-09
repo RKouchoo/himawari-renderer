@@ -77,6 +77,7 @@ All images below were rendered by this tool from a single scene
 | `--downsample` | `1` (video: `4`) | box-average factor on the 11000×11000 1 km grid (must divide 11000) |
 | `--threads` | all cores | rayon worker count |
 | `--cache-dir` | none | persistent download cache — never purged, stored zstd-recompressed so re-runs decode ~15× faster than the bucket's bzip2 |
+| `--cache-only` | off | never download: render from the cache alone, skipping timelapse scenes that aren't fully cached; without `--time`, uses the newest fully-cached scene |
 | `--combined` | off | day/night sandwich product (`_combined.png`) |
 | `--combined-style` | `convection` | palette for the combined product's overlay |
 | `--natural` | off | natural-color composite (`_natural.png`) |

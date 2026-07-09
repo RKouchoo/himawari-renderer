@@ -142,6 +142,12 @@ struct Args {
     /// follow. Implies --follow-storm.
     #[arg(long, requires = "timelapse", conflicts_with = "follow_seed")]
     pick_storm: bool,
+
+    /// Never download: render only from files already in --cache-dir,
+    /// skipping timelapse scenes that are not fully cached. Without --time,
+    /// the newest fully-cached scene is used.
+    #[arg(long, requires = "cache_dir")]
+    cache_only: bool,
 }
 
 fn parse_seed(text: &str) -> Result<(f64, f64), String> {
@@ -220,9 +226,14 @@ fn main() -> Result<()> {
             .with_context(|| format!("creating cache directory {}", dir.display()))?;
     }
 
+    fetch::set_cache_only(args.cache_only);
+
     let agent = fetch::agent();
     if args.watch && (args.time.is_some() || args.timelapse.is_some()) {
         bail!("--watch cannot be combined with --time or --timelapse");
+    }
+    if args.watch && args.cache_only {
+        bail!("--watch is about new scenes; it cannot run --cache-only");
     }
     if let Some(range) = &args.timelapse {
         return run_timelapse(&agent, &args, range);
@@ -233,9 +244,14 @@ fn main() -> Result<()> {
     }
 
     let (extra_bands, ir_needed) = required_bands(&args);
-    let time = match &args.time {
-        Some(text) => parse_time(text)?,
-        None => fetch::find_latest_scene(&agent, &extra_bands, &ir_needed)
+    let time = match (&args.time, args.cache_only) {
+        (Some(text), _) => parse_time(text)?,
+        (None, true) => fetch::find_latest_cached_scene(
+            args.cache_dir.as_deref().expect("--cache-only requires --cache-dir"),
+            &extra_bands,
+            &ir_needed,
+        )?,
+        (None, false) => fetch::find_latest_scene(&agent, &extra_bands, &ir_needed)
             .context("locating the latest scene")?,
     };
     run_scene(&agent, &args, time, downsample)

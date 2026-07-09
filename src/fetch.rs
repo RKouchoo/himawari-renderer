@@ -4,11 +4,12 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 use anyhow::{bail, Context, Result};
 use bzip2::read::MultiBzDecoder;
-use chrono::{DateTime, Duration, DurationRound, Utc};
+use chrono::{DateTime, Duration, DurationRound, NaiveDateTime, Utc};
 
 use crate::hsd;
 use crate::tuning::{
@@ -18,6 +19,18 @@ use crate::tuning::{
 
 const BUCKET_URL: &str = "https://noaa-himawari9.s3.amazonaws.com";
 pub const SEGMENTS_PER_DISK: u8 = 10;
+
+/// Process-wide --cache-only switch: when set, cache misses are errors
+/// instead of downloads.
+static CACHE_ONLY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_cache_only(enabled: bool) {
+    CACHE_ONLY.store(enabled, Ordering::Relaxed);
+}
+
+fn cache_only() -> bool {
+    CACHE_ONLY.load(Ordering::Relaxed)
+}
 
 /// Any AHI band that can be fetched from the bucket: enough identity to
 /// build the HSD file name and validate the parsed geometry against it.
@@ -228,6 +241,58 @@ pub fn find_latest_scene(
 /// DOWNLOAD_CONNECTIONS_PER_FILE concurrent connections. Files are already
 /// parallel with each other; the split lifts the per-connection throughput
 /// cap on each individual object as well.
+/// True when a segment is present in the cache in either format.
+fn cached_file_exists<B: AhiBand>(
+    cache_dir: &Path,
+    time: DateTime<Utc>,
+    band: B,
+    segment: u8,
+) -> bool {
+    let name = file_name(time, band, segment);
+    cache_dir.join(name.replace(".bz2", ".zst")).is_file() || cache_dir.join(name).is_file()
+}
+
+/// The newest scene whose required files are all present in the cache —
+/// the offline counterpart of `find_latest_scene` for --cache-only runs.
+pub fn find_latest_cached_scene(
+    cache_dir: &Path,
+    extra_bands: &[Band],
+    ir_bands: &[IrBand],
+) -> Result<DateTime<Utc>> {
+    // Collect candidate observation stamps from the file names present.
+    let mut stamps: Vec<DateTime<Utc>> = std::fs::read_dir(cache_dir)
+        .with_context(|| format!("reading {}", cache_dir.display()))?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let mut parts = name.strip_prefix("HS_H09_")?.splitn(3, '_');
+            let stamp = format!("{}{}", parts.next()?, parts.next()?);
+            NaiveDateTime::parse_from_str(&stamp, "%Y%m%d%H%M")
+                .ok()
+                .map(|naive| naive.and_utc())
+        })
+        .collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+
+    for &slot in stamps.iter().rev() {
+        let visible = Band::ALL.iter().chain(extra_bands).all(|&band| {
+            (1..=SEGMENTS_PER_DISK).all(|s| cached_file_exists(cache_dir, slot, band, s))
+        });
+        let ir = ir_bands.iter().all(|&band| {
+            (1..=SEGMENTS_PER_DISK).all(|s| cached_file_exists(cache_dir, slot, band, s))
+        });
+        if visible && ir {
+            return Ok(slot);
+        }
+    }
+    bail!(
+        "no fully-cached scene (with every required band) in {}",
+        cache_dir.display(),
+    );
+}
+
 fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
     let length = object_length(agent, url)?;
     if DOWNLOAD_CONNECTIONS_PER_FILE <= 1 || length < DOWNLOAD_SPLIT_MIN_BYTES {
@@ -386,6 +451,7 @@ pub fn fetch_segment<B: AhiBand>(
             let compressed = match &legacy_path {
                 Some(path) if path.is_file() => std::fs::read(path)
                     .with_context(|| format!("reading cached {}", path.display()))?,
+                _ if cache_only() => bail!("{name} is not in the cache (--cache-only)"),
                 _ => download(agent, &object_url(time, band, segment))?,
             };
             let mut raw = Vec::with_capacity(compressed.len() * 4);

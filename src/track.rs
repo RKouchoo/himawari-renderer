@@ -40,11 +40,17 @@ fn weight(bt: f32) -> f64 {
     }
 }
 
-/// First fix: slide a TRACK_SEED_WINDOW box over the (coarsely sampled)
-/// disk and pick the one holding the most cold-cloud weight, then refine to
-/// its centroid. The limb and high latitudes are excluded — limb cooling
-/// and the winter polar surface both masquerade as cold cloud.
+/// First fix: the strongest storm candidate on the disk.
 fn seed(bt: &[f32], width: usize) -> Option<Position> {
+    candidates(bt, width, 1).into_iter().next().map(|(pos, _)| pos)
+}
+
+/// The distinct storm candidates on the disk, strongest first: slide a
+/// TRACK_SEED_WINDOW box over the (coarsely sampled) disk, rank windows by
+/// cold-cloud weight, keep non-overlapping winners, and refine each to its
+/// centroid. The limb and high latitudes are excluded — limb cooling and
+/// the winter polar surface both masquerade as cold cloud.
+pub fn candidates(bt: &[f32], width: usize, limit: usize) -> Vec<(Position, f64)> {
     const STRIDE: usize = 8;
     let half = width as f64 / 2.0;
     let max_radius = half * TRACK_SEED_MAX_RADIUS;
@@ -61,27 +67,45 @@ fn seed(bt: &[f32], width: usize) -> Option<Position> {
     }
 
     let window = TRACK_SEED_WINDOW / STRIDE;
-    let mut best = (0f64, 0usize, 0usize);
+    let mut windows: Vec<(f64, usize, usize)> = Vec::new();
     for y in (0..coarse_width.saturating_sub(window)).step_by(window / 4) {
         for x in (0..coarse_width.saturating_sub(window)).step_by(window / 4) {
             let total: f64 = (y..y + window)
                 .map(|row| coarse[row * coarse_width + x..][..window].iter().sum::<f64>())
                 .sum();
-            if total > best.0 {
-                best = (total, x, y);
+            if total >= TRACK_MIN_WEIGHT {
+                windows.push((total, x, y));
             }
         }
     }
-    if best.0 < TRACK_MIN_WEIGHT {
-        return None;
-    }
+    windows.sort_by(|a, b| b.0.total_cmp(&a.0));
 
-    // Refine: centroid at full resolution within the winning box.
-    let center = (
-        ((best.1 + window / 2) * STRIDE) as f64,
-        ((best.2 + window / 2) * STRIDE) as f64,
-    );
-    Some(centroid(bt, width, center).unwrap_or(to_composite(center, width)))
+    // Greedy non-overlap suppression, then centroid refinement.
+    let mut chosen: Vec<(f64, usize, usize)> = Vec::new();
+    for (total, x, y) in windows {
+        // Two window-widths (~1000 km) of separation: one sprawling cyclone
+        // should yield one candidate, not three fragments of itself.
+        let overlaps = chosen
+            .iter()
+            .any(|&(_, cx, cy)| x.abs_diff(cx) < window * 2 && y.abs_diff(cy) < window * 2);
+        if !overlaps {
+            chosen.push((total, x, y));
+            if chosen.len() == limit {
+                break;
+            }
+        }
+    }
+    chosen
+        .into_iter()
+        .map(|(total, x, y)| {
+            let center = (
+                ((x + window / 2) * STRIDE) as f64,
+                ((y + window / 2) * STRIDE) as f64,
+            );
+            let position = centroid(bt, width, center).unwrap_or(to_composite(center, width));
+            (position, total)
+        })
+        .collect()
 }
 
 /// Subsequent frames: weighted centroid within the search radius of the

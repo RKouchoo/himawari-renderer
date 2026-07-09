@@ -88,6 +88,7 @@ All images below were rendered by this tool from a single scene
 | `--follow-storm` | off | timelapse only: auto-track the strongest storm and crop every frame centered on it |
 | `--follow-size` | `2048` | side of the storm crop, in km |
 | `--follow-seed` | auto | start the tracker at `LAT,LON` instead of auto-picking the strongest storm |
+| `--pick-storm` | off | interactive: preview the first scene's storm candidates and choose which to follow |
 | `--watch` | off | keep running; re-render all requested products for each new scene |
 
 Full-disk scenes exist every 10 minutes except two daily housekeeping
@@ -138,10 +139,11 @@ than a couple of GB on disk.
 
 **Storm follower** (`--follow-storm`, timelapse only) turns the frames into
 a storm-centered crop instead of the full disk: the tracker seeds on the
-largest cold-cloud mass on B13 (away from the limb and the winter pole), or
-on `--follow-seed LAT,LON` when several storms share the disk and you care
-about a specific one. It then follows scene to scene with a bounded search
-and a smoothed
+largest cold-cloud mass on B13 (away from the limb and the winter pole), on
+`--follow-seed LAT,LON`, or interactively with `--pick-storm`: the first
+scene's IR is fetched (a cheap ~60 MB), every distinct storm candidate is
+marked and numbered on a preview image, and the terminal asks which to
+follow. It then tracks scene to scene with a bounded search and a smoothed
 cold-centroid fix — the cyclone stays pinned mid-frame while the Earth
 slides behind it. `--follow-size` sets the crop in km; frames default to
 full 1 km resolution. Tracking thresholds are the `TRACK_*` constants in

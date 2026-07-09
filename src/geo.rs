@@ -123,6 +123,16 @@ impl Geometry {
         ])
     }
 
+    /// Inverse projection: pixel position to geodetic latitude/longitude in
+    /// degrees. None past the limb.
+    pub fn lat_lon(&self, col: f64, line: f64) -> Option<(f64, f64)> {
+        let [px, py, pz] = self.surface_point(col, line)?;
+        let pxy = (px * px + py * py).sqrt();
+        let lat = (self.req2_over_rpol2 * pz / pxy).atan().to_degrees();
+        let lon = (py.atan2(px) + self.sub_lon).to_degrees();
+        Some((lat, lon))
+    }
+
     /// Forward projection: geodetic latitude/longitude (degrees) to the
     /// (fractional, 0-based) pixel position on this projection's grid.
     /// None when the point is on the far side of the Earth.

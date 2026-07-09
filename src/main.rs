@@ -11,6 +11,7 @@ mod compose;
 mod fetch;
 mod geo;
 mod hsd;
+mod pick;
 mod track;
 mod tuning;
 
@@ -135,6 +136,12 @@ struct Args {
     /// "26.4,128.9". The tracker locks onto the nearest cold-cloud mass.
     #[arg(long, value_name = "LAT,LON", requires = "follow_storm", value_parser = parse_seed)]
     follow_seed: Option<(f64, f64)>,
+
+    /// Interactive storm picking: fetch the first scene's IR band, save an
+    /// annotated preview of every storm candidate, and ask which one to
+    /// follow. Implies --follow-storm.
+    #[arg(long, requires = "timelapse", conflicts_with = "follow_seed")]
+    pick_storm: bool,
 }
 
 fn parse_seed(text: &str) -> Result<(f64, f64), String> {
@@ -411,11 +418,12 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
     if !(1..=120).contains(&args.fps) {
         bail!("--fps must be between 1 and 120");
     }
+    let follow = args.follow_storm || args.pick_storm;
     // A storm crop is small, so full resolution is the natural default there.
     let downsample = args
         .downsample
-        .unwrap_or(if args.follow_storm { 1 } else { tuning::TIMELAPSE_DOWNSAMPLE });
-    let frame_size = if args.follow_storm {
+        .unwrap_or(if follow { 1 } else { tuning::TIMELAPSE_DOWNSAMPLE });
+    let frame_size = if follow {
         if !args.follow_size.is_multiple_of(downsample) || args.follow_size > FULL_DISK_SIZE {
             bail!("--follow-size must be a multiple of --downsample, at most {FULL_DISK_SIZE}");
         }
@@ -470,6 +478,14 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
         .map(|i| start + chrono::Duration::minutes(10 * i))
         .collect();
 
+    // Interactive picking happens before the pipeline spins up, using only
+    // the first scene's B13 (~60 MB).
+    let initial_track = if args.pick_storm {
+        Some(pick_storm_seed(agent, args, slots[0], &cache_dir)?)
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let frames_bar = progress().add(ProgressBar::new(slots.len() as u64));
     frames_bar.set_style(
@@ -495,7 +511,7 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
             scope.spawn(move || loop {
                 let index = next_slot.fetch_add(1, Ordering::SeqCst);
                 let Some(&slot) = slots.get(index) else { break };
-                let with_b13 = args.combined || args.follow_storm;
+                let with_b13 = args.combined || follow;
                 let scene = fetch_scene(agent, slot, with_b13, cache_dir);
                 if !user_cache {
                     purge_scene_cache(cache_dir, slot);
@@ -509,7 +525,7 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
 
         let mut out_of_order: HashMap<usize, Result<Scene>> = HashMap::new();
         let mut rendered = 0usize;
-        let mut storm_track: Option<track::Position> = None;
+        let mut storm_track: Option<track::Position> = initial_track;
         for expected in 0..slots.len() {
             let scene = loop {
                 if let Some(scene) = out_of_order.remove(&expected) {
@@ -522,7 +538,7 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
             };
             let frame_path = frames_dir.join(format!("frame_{:05}.png", rendered + 1));
             let outcome = scene.and_then(|scene| {
-                let window = if args.follow_storm {
+                let window = if follow {
                     let (calibration, _, counts) =
                         scene.b13.as_ref().context("storm following needs B13")?;
                     let bt = compose::brightness_grid(calibration, counts)
@@ -601,6 +617,54 @@ fn run_timelapse(agent: &ureq::Agent, args: &Args, range: &str) -> Result<()> {
         started.elapsed().as_secs_f32(),
     ));
     Ok(())
+}
+
+/// Fetch the first scene's B13, detect storm candidates, and ask the user
+/// which one to follow (writing an annotated preview image).
+fn pick_storm_seed(
+    agent: &ureq::Agent,
+    args: &Args,
+    slot: DateTime<Utc>,
+    cache_dir: &Path,
+) -> Result<track::Position> {
+    status(format!(
+        "Storm picker: fetching {} UTC B13…",
+        slot.format("%H:%M"),
+    ));
+    let b13 = IrBand::new(13).expect("13 is a valid IR band");
+    let bar = band_bar(b13.to_string());
+    let segments = (1..=SEGMENTS_PER_DISK)
+        .into_par_iter()
+        .map(|segment| fetch::fetch_segment(agent, slot, b13, segment, Some(cache_dir), &bar))
+        .collect::<Result<Vec<_>>>()?;
+    bar.finish_and_clear();
+    let (calibration, projection, counts) = compose::assemble_counts(IrBand::WIDTH, segments)?;
+    let bt = compose::brightness_grid(&calibration, &counts)
+        .context("B13 lacks thermal calibration")?;
+
+    let candidates = track::candidates(&bt, IrBand::WIDTH, 6);
+    if candidates.is_empty() {
+        bail!("no storm-like cold cloud found in the first scene");
+    }
+    let geometry = geo::Geometry::new(&projection, slot);
+    let to_b13 = IrBand::WIDTH as f64 / FULL_DISK_SIZE as f64;
+    let lat_lons: Vec<Option<(f64, f64)>> = candidates
+        .iter()
+        .map(|((col, line), _)| geometry.lat_lon(col * to_b13, line * to_b13))
+        .collect();
+
+    let preview = compose::ir_enhancement(
+        &calibration,
+        &counts,
+        IrBand::WIDTH,
+        compose::ClutStyle::Convection,
+    )?;
+    pick::choose(
+        &preview,
+        &candidates,
+        &lat_lons,
+        &suffixed_output_path(&args.out, "pick"),
+    )
 }
 
 /// Watch mode: poll the bucket and render every new scene as it appears,

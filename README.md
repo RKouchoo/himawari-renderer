@@ -47,7 +47,7 @@ cargo build --release
 # Six hours of Earth as a 12 fps video
 ./target/release/himawari-earth --timelapse 2026-07-09T00:00..2026-07-09T06:00
 
-# Three hours of a typhoon, tracked and cropped (see the demo below)
+# Three hours of a typhoon, tracked and cropped
 ./target/release/himawari-earth --timelapse 2026-07-09T02:00..2026-07-09T05:00 \
     --follow-storm --follow-seed 24.5,125.5
 
@@ -166,11 +166,11 @@ full 1 km resolution. Tracking thresholds are the `TRACK_*` constants in
 [`src/tuning.rs`](src/tuning.rs).
 
 <p align="center">
-  <img src="examples/previews/follow_typhoon.gif" width="55%" alt="Storm follower demo: a typhoon tracked over three hours, pinned mid-frame">
+  <img src="examples/previews/follow_typhoon.gif" width="55%" alt="Storm follower demo: a typhoon tracked through a full day of daylight, pinned mid-frame">
 </p>
-<p align="center"><sub>Three hours of a typhoon east of Taiwan (2026-07-09), tracked with
-<code>--follow-storm --follow-seed 24.5,125.5</code> — full video in
-<a href="examples/follow_typhoon.mp4"><code>examples/follow_typhoon.mp4</code></a>.</sub></p>
+<p align="center"><sub>One day of a typhoon tracked with <code>--follow-storm</code>, fading out as night
+falls — the full run follows it for two and a half days as it spirals toward Taiwan
+(ending 2026-07-09): <a href="examples/follow_typhoon.mp4"><code>examples/follow_typhoon.mp4</code></a>.</sub></p>
 
 **Watch** (`--watch`) polls the bucket and re-renders everything you asked
 for whenever a new scene finishes uploading — point `--out` at your
